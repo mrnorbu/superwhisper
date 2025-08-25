@@ -1,0 +1,489 @@
+"""
+SuperWhisper — Minimal floating UI with 3 states and a global F9 hotkey.
+
+States:
+- Ready (green): Click or press F9 to start recording
+- Recording (red): Capturing audio; press F9 or click to stop, or stops on silence
+- Transcribing (amber): Processing; then copies and auto-pastes (macOS) into the active app
+
+Dependencies:
+    pip install faster-whisper sounddevice numpy scipy pyperclip pynput
+
+macOS notes:
+- To allow global hotkey listening and auto-paste (Cmd+V), grant Accessibility permission to Python:
+  System Settings > Privacy & Security > Accessibility → add Python (or your packaged app).
+- If F9 requires Fn+F9 on your keyboard, enable “Use F1, F2, etc. keys as standard function keys”
+  in System Settings > Keyboard, or change the hotkey in the handler below.
+
+Windows/Linux:
+- No special permissions typically required for the global hotkey. Auto-paste uses clipboard only.
+"""
+
+import tkinter as tk
+import threading
+import time
+import numpy as np
+import sounddevice as sd
+from scipy.io.wavfile import write
+from faster_whisper import WhisperModel
+import pyperclip
+import subprocess
+import platform
+import os
+
+# Global hotkey support (works when app is not focused)
+try:
+    from pynput import keyboard
+    PYNPUT_AVAILABLE = True
+except Exception:
+    PYNPUT_AVAILABLE = False
+
+# =========================
+# Configuration
+# =========================
+SR = 16000                     # Sample rate for audio recording
+SILENCE_THRESHOLD = 0.01       # Threshold for detecting voice activity
+SILENCE_DURATION = 2.0         # Seconds of silence to auto-stop recording
+MAX_DURATION = 30              # Safety cap for max recording length in seconds
+
+# Colors for the three states
+BG_COLOR = "#121212"           # App background
+FG_TEXT = "#D9D9D9"            # Primary text
+FG_HINT = "#9A9A9A"            # Hint text
+
+COLOR_READY = "#4CAF50"        # Green: Ready
+COLOR_RECORD = "#f44336"       # Red: Recording
+COLOR_TRANSCRIBE = "#FFB300"   # Amber: Transcribing
+
+# Modern font selection per OS (fallback-friendly)
+if platform.system() == "Darwin":
+    UI_FONT = ("SF Pro Text", 11)
+    ICON_FONT = ("SF Pro Display", 24, "bold")
+elif platform.system() == "Windows":
+    UI_FONT = ("Segoe UI", 10)
+    ICON_FONT = ("Segoe UI", 22, "bold")
+else:
+    UI_FONT = ("Inter", 10)
+    ICON_FONT = ("Inter", 22, "bold")
+
+HOTKEY_LABEL = "F9"  # Displayed in the hint; actual key handled in pynput listener
+
+# =========================
+# UI: Circular Button
+# =========================
+class CircularButton(tk.Canvas):
+    """
+    Simple circular button built on Canvas to achieve a modern floating-button look.
+    Uses neutral glyphs (not emojis) for icons:
+    - Ready: "•"
+    - Recording: "■"
+    - Transcribing: "…"
+    """
+    def __init__(self, parent, size=72, color=COLOR_READY, icon="•", **kwargs):
+        super().__init__(parent, width=size, height=size, highlightthickness=0, bg=parent["bg"], bd=0, **kwargs)
+        self.size = size
+        self.color = color
+
+        # Main circle
+        self.circle = self.create_oval(2, 2, size - 2, size - 2, fill=color, outline="")
+
+        # Centered icon text
+        self.icon = self.create_text(size // 2, size // 2, text=icon, fill="white", font=ICON_FONT)
+
+        # Click handler set by caller
+        self.action = None
+
+        # Hover effects for subtle feedback
+        self.bind("<Button-1>", lambda e: self.action() if self.action else None)
+        self.bind("<Enter>", self._hover)
+        self.bind("<Leave>", self._unhover)
+
+    def set_action(self, func):
+        self.action = func
+
+    def set_state(self, color, icon):
+        """Update color and icon to reflect the app state."""
+        self.color = color
+        self.itemconfig(self.circle, fill=color)
+        self.itemconfig(self.icon, text=icon)
+
+    def _hover(self, _e):
+        # Lighten color slightly on hover
+        self.itemconfig(self.circle, fill=self._lighten(self.color, 0.12))
+
+    def _unhover(self, _e):
+        # Restore to original color on mouse leave
+        self.itemconfig(self.circle, fill=self.color)
+
+    @staticmethod
+    def _lighten(hex_color, factor):
+        """Return a lighter shade of the given hex color by factor [0..1]."""
+        hex_color = hex_color.lstrip("#")
+        r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
+        r = min(255, int(r + (255 - r) * factor))
+        g = min(255, int(g + (255 - g) * factor))
+        b = min(255, int(b + (255 - b) * factor))
+        return f"#{r:02x}{g:02x}{b:02x}"
+
+# =========================
+# App with 3 clear states + global hotkey
+# =========================
+class SuperWhisperApp:
+    """
+    Minimal 3-state app:
+    - Ready: green button, hint shows F9 usage
+    - Recording: red button, stops on silence, max duration, or hotkey/click
+    - Transcribing: amber button, blocks input, then copies and auto-pastes on macOS
+    """
+    STATE_READY = "ready"
+    STATE_RECORDING = "recording"
+    STATE_TRANSCRIBING = "transcribing"
+
+    def __init__(self, root):
+        # Window setup
+        self.root = root
+        self.root.title("SuperWhisper")
+        self.root.configure(bg=BG_COLOR)
+        self.root.overrideredirect(True)     # Frameless window for floating look
+        self.root.attributes("-topmost", True)
+        self.root.resizable(False, False)
+        self.root.geometry("220x170+1200+120")
+
+        # App state
+        self.state = self.STATE_READY
+        self.is_recording = False
+        self.audio_buffer = []
+        self.model = None
+
+        # Global hotkey listener
+        self._listener = None
+        self._last_hotkey_time = 0.0  # debounce to avoid repeat triggers
+
+        # Build UI
+        self._build_ui()
+
+        # App-scoped hotkey as fallback when the app has focus
+        self.root.bind("<F9>", lambda e: self._on_hotkey())
+
+        # Load Whisper model asynchronously (non-blocking UI)
+        threading.Thread(target=self._load_model, daemon=True).start()
+
+        # Start global hotkey listener (works when app is not focused)
+        self._start_global_hotkey()
+
+    # -------------------------
+    # UI
+    # -------------------------
+    def _build_ui(self):
+        container = tk.Frame(self.root, bg=BG_COLOR, padx=12, pady=12)
+        container.pack(expand=True, fill="both")
+
+        # Floating circular button
+        self.button = CircularButton(container, size=72, color=COLOR_READY, icon="•")
+        self.button.set_action(self._on_button_click)
+        self.button.pack(pady=(0, 10))
+
+        # Status text
+        self.status = tk.Label(container, text="Loading Whisper…", bg=BG_COLOR, fg=FG_TEXT, font=UI_FONT)
+        self.status.pack()
+
+        # Hint text
+        self.hint = tk.Label(
+            container,
+            text=f"Click or press {HOTKEY_LABEL} to start",
+            bg=BG_COLOR,
+            fg=FG_HINT,
+            font=UI_FONT
+        )
+        self.hint.pack(pady=(4, 0))
+
+        # Drag window from the background elements
+        for w in (container, self.status, self.hint):
+            w.bind("<Button-1>", self._start_drag)
+            w.bind("<B1-Motion>", self._on_drag)
+
+        # Esc to close quickly
+        self.root.bind("<Escape>", lambda e: self.root.destroy())
+
+    # -------------------------
+    # Model loading
+    # -------------------------
+    def _load_model(self):
+        """Load the Whisper model in a background thread."""
+        self._set_status("Loading Whisper (small)…")
+        try:
+            # Use CPU int8 for lightweight usage on most machines
+            self.model = WhisperModel("small", device="cpu", compute_type="int8")
+            self._set_status("Ready")
+            self._to_ready()
+        except Exception as e:
+            self._set_status(f"Model error: {e}")
+
+    # -------------------------
+    # Global hotkey
+    # -------------------------
+    def _start_global_hotkey(self):
+        """
+        Start a global hotkey listener so F9 triggers recording even when the app is unfocused.
+
+        macOS:
+        - Requires Accessibility permission for Python.
+        - If F9 needs Fn+F9 on your keyboard, either enable standard function keys
+          in System Settings > Keyboard or change the hotkey below.
+
+        To change the hotkey:
+        - Replace `keyboard.Key.f9` with another key (e.g., keyboard.Key.f8), or
+        - Implement a chord in on_press (e.g., ctrl+alt+space).
+        """
+        if not PYNPUT_AVAILABLE:
+            self._set_status("Ready (install 'pynput' for global hotkey)")
+            return
+
+        def on_press(key):
+            # Debounce to prevent rapid repeat when holding the key
+            now = time.time()
+            if now - self._last_hotkey_time < 0.25:
+                return
+
+            try:
+                # Default: F9 global hotkey
+                if key == keyboard.Key.f9:
+                    self._last_hotkey_time = now
+                    # Schedule UI-safe call on the Tk main thread
+                    self.root.after(0, self._on_hotkey)
+
+                # Example alternative chord (uncomment to use CTRL+ALT+SPACE):
+                # if key == keyboard.Key.space:
+                #     pressed = keyboard.Controller()._pressed_events  # internal; may vary by platform
+                #     if keyboard.Key.ctrl in pressed and keyboard.Key.alt in pressed:
+                #         self._last_hotkey_time = now
+                #         self.root.after(0, self._on_hotkey)
+
+            except Exception:
+                # Ignore listener errors silently to keep app stable
+                pass
+
+        def on_release(_key):
+            # No action on release in toggle mode
+            pass
+
+        # Stop any existing listener before starting a new one
+        self._stop_global_hotkey()
+
+        try:
+            self._listener = keyboard.Listener(on_press=on_press, on_release=on_release)
+            self._listener.daemon = True
+            self._listener.start()
+            self._set_status("Ready")
+        except Exception as e:
+            self._set_status(f"Hotkey unavailable: {e}")
+
+    def _stop_global_hotkey(self):
+        """Stop the global hotkey listener if running."""
+        if self._listener:
+            try:
+                self._listener.stop()
+            except Exception:
+                pass
+            self._listener = None
+
+    # -------------------------
+    # State transitions
+    # -------------------------
+    def _to_ready(self):
+        """Set UI and state to Ready."""
+        self.state = self.STATE_READY
+        self.is_recording = False
+        self.button.set_state(COLOR_READY, "•")
+        self._set_status("Ready")
+        self.hint.config(text=f"Click or press {HOTKEY_LABEL} to start")
+
+    def _to_recording(self):
+        """Set UI and state to Recording and start audio capture."""
+        self.state = self.STATE_RECORDING
+        self.is_recording = True
+        self.audio_buffer = []
+        self.button.set_state(COLOR_RECORD, "■")
+        self._set_status("Recording…")
+        self.hint.config(text=f"Click or press {HOTKEY_LABEL} to stop")
+        threading.Thread(target=self._record_audio, daemon=True).start()
+
+    def _to_transcribing(self):
+        """Set UI and state to Transcribing and start transcription."""
+        self.state = self.STATE_TRANSCRIBING
+        self.is_recording = False
+        self.button.set_state(COLOR_TRANSCRIBE, "…")
+        self._set_status("Transcribing…")
+        self.hint.config(text="Please wait")
+        threading.Thread(target=self._transcribe, daemon=True).start()
+
+    # -------------------------
+    # Event handlers
+    # -------------------------
+    def _on_button_click(self):
+        """Primary button behavior mirrors hotkey behavior."""
+        if self.state == self.STATE_READY:
+            if self.model is None:
+                self._set_status("Model not ready")
+                return
+            self._to_recording()
+        elif self.state == self.STATE_RECORDING:
+            # Stop recording
+            self.is_recording = False
+        # When transcribing, ignore input to avoid interrupting
+
+    def _on_hotkey(self):
+        """Global/App hotkey behavior: toggle between Ready and Recording."""
+        if self.state == self.STATE_READY:
+            if self.model is None:
+                self._set_status("Model not ready")
+                return
+            self._to_recording()
+        elif self.state == self.STATE_RECORDING:
+            self.is_recording = False
+
+    # -------------------------
+    # Audio recording
+    # -------------------------
+    def _record_audio(self):
+        """
+        Read audio from the default microphone until:
+        - User stops (hotkey or click), or
+        - Silence persists beyond SILENCE_DURATION, or
+        - MAX_DURATION is reached.
+        """
+        stream = None
+        try:
+            # Use a small blocksize to reduce latency
+            stream = sd.InputStream(samplerate=SR, channels=1, dtype="float32", blocksize=1024)
+            stream.start()
+            last_voice = time.time()
+            start_time = time.time()
+
+            while self.is_recording:
+                chunk, _ = stream.read(1024)
+                self.audio_buffer.append(chunk.copy())
+
+                # Voice activity detection (simple amplitude check)
+                amp = float(np.abs(chunk).max())
+                if amp > SILENCE_THRESHOLD:
+                    last_voice = time.time()
+
+                # Auto-stop on silence or max duration
+                now = time.time()
+                if (now - last_voice) > SILENCE_DURATION:
+                    break
+                if (now - start_time) > MAX_DURATION:
+                    break
+
+        except Exception as e:
+            # Show error and return to Ready
+            self._set_status(f"Audio error: {e}")
+            self.root.after(0, self._to_ready)
+            return
+        finally:
+            # Clean up audio stream safely
+            try:
+                if stream:
+                    stream.stop()
+                    stream.close()
+            except Exception:
+                pass
+
+        # Move to transcribing after capture completes
+        self.root.after(0, self._to_transcribing)
+
+    # -------------------------
+    # Transcription
+    # -------------------------
+    def _transcribe(self):
+        """
+        Save recorded audio to a temp WAV, transcribe with faster-whisper,
+        then copy text to clipboard and auto-paste (macOS).
+        """
+        try:
+            if not self.audio_buffer:
+                self.root.after(0, lambda: self._finish_with_message("No audio"))
+                return
+
+            audio = np.concatenate(self.audio_buffer, axis=0)
+            if audio.size == 0 or np.max(np.abs(audio)) < 1e-3:
+                self.root.after(0, lambda: self._finish_with_message("Too quiet"))
+                return
+
+            tmp = "temp_recording.wav"
+            write(tmp, SR, (audio * 32767).astype(np.int16))
+
+            segments, _ = self.model.transcribe(tmp, vad_filter=True)
+            text = "".join(s.text for s in segments).strip()
+
+            # Clean temp file
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
+
+            if text:
+                self._copy_and_paste(text)
+                self.root.after(0, lambda: self._finish_with_message("Pasted to editor"))
+            else:
+                self.root.after(0, lambda: self._finish_with_message("No speech"))
+        except Exception as e:
+            self.root.after(0, lambda: self._finish_with_message(f"Error: {e}"))
+
+    def _finish_with_message(self, msg):
+        """Show a short message, then revert to Ready."""
+        self._set_status(msg)
+        self.root.after(1200, self._to_ready)
+
+    # -------------------------
+    # Clipboard + auto-paste
+    # -------------------------
+    def _copy_and_paste(self, text):
+        """
+        Copy transcription to clipboard and, on macOS, simulate Cmd+V to paste
+        into the frontmost app (e.g., Cursor, editor, etc.).
+        """
+        try:
+            pyperclip.copy(text)
+        except Exception as e:
+            self._set_status(f"Clipboard error: {e}")
+            return
+
+        if platform.system() == "Darwin":
+            # Try to paste into the active app via AppleScript keystroke
+            try:
+                subprocess.run(
+                    ["osascript", "-e", 'tell application "System Events" to keystroke "v" using command down'],
+                    check=False,
+                    timeout=2
+                )
+            except Exception:
+                # If blocked by permissions, text is still on clipboard
+                self._set_status("Copied — press Cmd+V")
+
+    # -------------------------
+    # UI utilities and drag
+    # -------------------------
+    def _set_status(self, msg):
+        self.status.config(text=msg)
+
+    def _start_drag(self, e):
+        self._dx, self._dy = e.x, e.y
+
+    def _on_drag(self, e):
+        x = self.root.winfo_x() + (e.x - self._dx)
+        y = self.root.winfo_y() + (e.y - self._dy)
+        self.root.geometry(f"+{x}+{y}")
+
+# =========================
+# Entry point
+# =========================
+def main():
+    root = tk.Tk()
+    app = SuperWhisperApp(root)
+    root.mainloop()
+
+if __name__ == "__main__":
+    main()
+
