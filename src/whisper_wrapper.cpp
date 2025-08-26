@@ -1,8 +1,10 @@
 #include "whisper_wrapper.hpp"
+#include "settings.hpp"
 #include "whisper.h"
 #include <iostream>
 #include <algorithm>
 #include <cmath>
+#include <thread>
 
 namespace SuperWhisper {
 
@@ -41,7 +43,7 @@ public:
         return true;
     }
     
-    std::string transcribe(const AudioBuffer& audio, int sample_rate) override {
+    std::string transcribe(const AudioBuffer& audio, int sample_rate, const Settings& settings) override {
         if (!is_loaded_ || !ctx_) {
             return "";
         }
@@ -71,27 +73,35 @@ public:
         // Shrink to fit to free unused memory before inference
         resampled_audio.shrink_to_fit();
         
-        // Configure transcription parameters for SPEED + STABILITY
+        // Configure transcription parameters from settings
         whisper_full_params params = whisper_full_default_params(WHISPER_SAMPLING_GREEDY);
         
-        // Optimize threading for Apple Silicon with GPU
-        params.n_threads = std::min(4, (int)std::thread::hardware_concurrency()); // Conservative threading with GPU
+        // Use settings for all configurable parameters
+        params.n_threads = settings.num_threads;
+        params.translate = settings.translate_to_english;
+        params.language = settings.language == "auto" ? nullptr : settings.language.c_str();
+        params.detect_language = (settings.language == "auto");
+        params.max_tokens = settings.max_tokens;
+        params.temperature = settings.temperature;
         
-        // Speed optimizations (more conservative)
-        params.translate = false;
-        params.language = "en";
-        params.detect_language = false;
-        params.suppress_blank = true;
-        params.suppress_non_speech_tokens = true;
-        params.token_timestamps = false;  // Disable timestamps for speed
-        params.print_progress = false;    // Disable progress printing
-        params.print_realtime = false;    // Disable real-time printing
-        params.print_timestamps = false;  // Disable timestamp printing
+        // Note: top_p, top_k, and repetition_penalty are not available in whisper.cpp
+        // These are kept in settings for future compatibility but not used here
         
-        // Conservative thresholds for stability with GPU
-        params.entropy_thold = 2.4f;      // Standard threshold
-        params.logprob_thold = -1.0f;
-        params.no_speech_thold = 0.6f;    // Standard silence detection
+        // Output formatting settings
+        params.suppress_blank = settings.suppress_blank;
+        params.suppress_non_speech_tokens = settings.suppress_non_speech_tokens;
+        params.token_timestamps = settings.print_timestamps;
+        params.print_progress = settings.print_progress;
+        params.print_realtime = false;  // Always false for CLI
+        params.print_timestamps = settings.print_timestamps;
+        
+        // Note: print_colors and print_special are not available in whisper.cpp
+        // These are kept in settings for future compatibility but not used here
+        
+        // Thresholds (now configurable from settings)
+        params.entropy_thold = settings.entropy_threshold;
+        params.logprob_thold = settings.logprob_threshold;
+        params.no_speech_thold = settings.no_speech_threshold;
         
         // Run transcription
         int result = whisper_full(ctx_, params, resampled_audio.data(), resampled_audio.size());
@@ -100,14 +110,87 @@ public:
             return "";
         }
         
-        // Extract text from segments
+        // Extract text based on output format
         std::string transcription;
-        const int n_segments = whisper_full_n_segments(ctx_);
         
-        for (int i = 0; i < n_segments; ++i) {
-            const char* text = whisper_full_get_segment_text(ctx_, i);
-            if (text) {
-                transcription += text;
+        if (settings.output_format == "json") {
+            // JSON output format
+            transcription = "{\n  \"segments\": [\n";
+            const int n_segments = whisper_full_n_segments(ctx_);
+            
+            for (int i = 0; i < n_segments; ++i) {
+                const char* text = whisper_full_get_segment_text(ctx_, i);
+                float start_time = whisper_full_get_segment_t0(ctx_, i) / 100.0f;
+                float end_time = whisper_full_get_segment_t1(ctx_, i) / 100.0f;
+                
+                if (text) {
+                    if (i > 0) transcription += ",\n";
+                    transcription += "    {\n";
+                    transcription += "      \"id\": " + std::to_string(i) + ",\n";
+                    transcription += "      \"start\": " + std::to_string(start_time) + ",\n";
+                    transcription += "      \"end\": " + std::to_string(end_time) + ",\n";
+                    transcription += "      \"text\": \"" + std::string(text) + "\"\n";
+                    transcription += "    }";
+                }
+            }
+            transcription += "\n  ]\n}";
+            
+        } else if (settings.output_format == "srt") {
+            // SRT subtitle format
+            const int n_segments = whisper_full_n_segments(ctx_);
+            
+            for (int i = 0; i < n_segments; ++i) {
+                const char* text = whisper_full_get_segment_text(ctx_, i);
+                float start_time = whisper_full_get_segment_t0(ctx_, i) / 100.0f;
+                float end_time = whisper_full_get_segment_t1(ctx_, i) / 100.0f;
+                
+                if (text) {
+                    transcription += std::to_string(i + 1) + "\n";
+                    transcription += format_time_srt(start_time) + " --> " + format_time_srt(end_time) + "\n";
+                    transcription += std::string(text) + "\n\n";
+                }
+            }
+            
+        } else if (settings.output_format == "vtt") {
+            // VTT subtitle format
+            transcription = "WEBVTT\n\n";
+            const int n_segments = whisper_full_n_segments(ctx_);
+            
+            for (int i = 0; i < n_segments; ++i) {
+                const char* text = whisper_full_get_segment_text(ctx_, i);
+                float start_time = whisper_full_get_segment_t0(ctx_, i) / 100.0f;
+                float end_time = whisper_full_get_segment_t1(ctx_, i) / 100.0f;
+                
+                if (text) {
+                    transcription += format_time_vtt(start_time) + " --> " + format_time_vtt(end_time) + "\n";
+                    transcription += std::string(text) + "\n\n";
+                }
+            }
+            
+        } else if (settings.output_format == "csv") {
+            // CSV format
+            transcription = "start_time,end_time,text\n";
+            const int n_segments = whisper_full_n_segments(ctx_);
+            
+            for (int i = 0; i < n_segments; ++i) {
+                const char* text = whisper_full_get_segment_text(ctx_, i);
+                float start_time = whisper_full_get_segment_t0(ctx_, i) / 100.0f;
+                float end_time = whisper_full_get_segment_t1(ctx_, i) / 100.0f;
+                
+                if (text) {
+                    transcription += std::to_string(start_time) + "," + std::to_string(end_time) + ",\"" + std::string(text) + "\"\n";
+                }
+            }
+            
+        } else {
+            // Default text format
+            const int n_segments = whisper_full_n_segments(ctx_);
+            
+            for (int i = 0; i < n_segments; ++i) {
+                const char* text = whisper_full_get_segment_text(ctx_, i);
+                if (text) {
+                    transcription += text;
+                }
             }
         }
         
@@ -166,17 +249,38 @@ private:
         
         for (size_t i = 0; i < output_size; ++i) {
             double input_index = i / ratio;
-            size_t input_i = static_cast<size_t>(input_index);
-            double fraction = input_index - input_i;
+            size_t index1 = static_cast<size_t>(input_index);
+            size_t index2 = std::min(index1 + 1, input.size() - 1);
+            double fraction = input_index - index1;
             
-            if (input_i + 1 < input.size()) {
-                output[i] = input[input_i] * (1.0 - fraction) + input[input_i + 1] * fraction;
-            } else {
-                output[i] = input[input_i];
-            }
+            output[i] = input[index1] * (1.0 - fraction) + input[index2] * fraction;
         }
         
         return output;
+    }
+    
+    // Helper function to format time for SRT format (HH:MM:SS,mmm)
+    std::string format_time_srt(float seconds) {
+        int hours = static_cast<int>(seconds) / 3600;
+        int minutes = (static_cast<int>(seconds) % 3600) / 60;
+        int secs = static_cast<int>(seconds) % 60;
+        int millisecs = static_cast<int>((seconds - static_cast<int>(seconds)) * 1000);
+        
+        char buffer[16];
+        snprintf(buffer, sizeof(buffer), "%02d:%02d:%02d,%03d", hours, minutes, secs, millisecs);
+        return std::string(buffer);
+    }
+    
+    // Helper function to format time for VTT format (HH:MM:SS.mmm)
+    std::string format_time_vtt(float seconds) {
+        int hours = static_cast<int>(seconds) / 3600;
+        int minutes = (static_cast<int>(seconds) % 3600) / 60;
+        int secs = static_cast<int>(seconds) % 60;
+        int millisecs = static_cast<int>((seconds - static_cast<int>(seconds)) * 1000);
+        
+        char buffer[16];
+        snprintf(buffer, sizeof(buffer), "%02d:%02d:%02d.%03d", hours, minutes, secs, millisecs);
+        return std::string(buffer);
     }
     
     whisper_context* ctx_;

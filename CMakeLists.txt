@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(SuperWhisper)
+project(SuperWhisperCLI)
 
 # Set C++ standard
 set(CMAKE_CXX_STANDARD 20)
@@ -20,20 +20,12 @@ endif()
 
 # Find packages
 find_package(PkgConfig REQUIRED)
-find_package(OpenGL REQUIRED)
-
-# GLFW
-find_package(glfw3 REQUIRED)
 
 # PortAudio - use pkg-config to find it
 pkg_check_modules(PORTAUDIO REQUIRED portaudio-2.0)
 
-# Dear ImGui - build from source
-set(IMGUI_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/imgui")
-if(NOT EXISTS "${IMGUI_DIR}/CMakeLists.txt")
-    message(FATAL_ERROR "Dear ImGui CMakeLists.txt not found. Run ./build.sh to download dependencies.")
-endif()
-add_subdirectory(external/imgui)
+# nlohmann/json - header-only library
+find_package(nlohmann_json 3.2.0 REQUIRED)
 
 # whisper.cpp - build from source with MAXIMUM PERFORMANCE
 set(WHISPER_DIR "${CMAKE_CURRENT_SOURCE_DIR}/external/whisper.cpp")
@@ -56,46 +48,42 @@ set(GGML_LTO ON CACHE BOOL "Enable Link Time Optimization")
 
 add_subdirectory(external/whisper.cpp)
 
-# Set source files
+# Set source files for CLI version
 set(SOURCES
-    src/main.cpp
+    src/cli_main.cpp
     src/audio_recorder.cpp
     src/whisper_wrapper.cpp
-    src/gui_manager.cpp
-    src/hotkey_manager.cpp
     src/settings.cpp
+    src/hotkey_manager.cpp
 )
 
 # Create executable
-add_executable(SuperWhisper ${SOURCES})
+add_executable(SuperWhisperCLI ${SOURCES})
 
 # Include directories
-target_include_directories(SuperWhisper PRIVATE
+target_include_directories(SuperWhisperCLI PRIVATE
     src/
-    external/imgui
     external/whisper.cpp
     ${PORTAUDIO_INCLUDE_DIRS}
 )
 
 # Link libraries
-target_link_libraries(SuperWhisper PRIVATE
-    imgui
+target_link_libraries(SuperWhisperCLI PRIVATE
     whisper
-    glfw
     ${PORTAUDIO_LIBRARIES}
-    OpenGL::GL
     ${CMAKE_DL_LIBS}
+    nlohmann_json::nlohmann_json
 )
 
 # Link directories
-target_link_directories(SuperWhisper PRIVATE ${PORTAUDIO_LIBRARY_DIRS})
+target_link_directories(SuperWhisperCLI PRIVATE ${PORTAUDIO_LIBRARY_DIRS})
 
 # Compiler flags
-target_compile_options(SuperWhisper PRIVATE ${PORTAUDIO_CFLAGS_OTHER})
+target_compile_options(SuperWhisperCLI PRIVATE ${PORTAUDIO_CFLAGS_OTHER})
 
 # macOS specific settings
 if(APPLE)
-    target_link_libraries(SuperWhisper PRIVATE
+    target_link_libraries(SuperWhisperCLI PRIVATE
         "-framework Cocoa"
         "-framework IOKit"
         "-framework CoreVideo"
@@ -103,17 +91,11 @@ if(APPLE)
         "-framework CoreAudio"
         "-framework Carbon"
     )
-    
-    # Set bundle properties
-    set_target_properties(SuperWhisper PROPERTIES
-        MACOSX_BUNDLE TRUE
-        MACOSX_BUNDLE_INFO_PLIST "${CMAKE_CURRENT_SOURCE_DIR}/Info.plist"
-    )
 endif()
 
 # Compiler warnings
 if(CMAKE_CXX_COMPILER_ID MATCHES "Clang|GNU")
-    target_compile_options(SuperWhisper PRIVATE
+    target_compile_options(SuperWhisperCLI PRIVATE
         -Wall -Wextra -Wpedantic
         -Wno-unused-parameter
         -Wno-unused-variable
